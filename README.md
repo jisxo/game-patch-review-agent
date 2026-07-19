@@ -1,442 +1,613 @@
-# 게임 업데이트 반응 분석기
+# Game Update Reaction Analyzer
 
-> 게임 패치노트와 유저 리뷰를 연결해, 업데이트 이후 유저 반응이 어떻게 변했는지 분석하고 불만 유형·원인 후보·심각도·운영 대응안을 근거 기반으로 생성하는 RAG/Agent 프로젝트.
+> Steam 한국어 리뷰와 게임 패치노트·공지를 이용해 업데이트 전후의 반응 변화를 관측하고, LLM/RAG로 리뷰 이슈와 관련 가능한 공개 근거를 연결하는 분석 시스템
 
----
+## 1. 프로젝트 정의
 
-## 1. 프로젝트 목적
+라이브 서비스 게임은 업데이트 직후 밸런스, 매칭, 서버, 버그, 성능 등 다양한 반응을 받는다. 하지만 운영자가 많은 리뷰를 직접 읽고, 반응 변화와 패치 내용을 연결해 우선 확인할 문제를 찾는 데는 시간이 걸린다.
 
-게임 업데이트 이후 유저 반응은 빠르게 변하지만, 운영자가 모든 리뷰를 직접 읽고 패치노트와 연결해 원인을 추정하기는 어렵다. 이 프로젝트는 공개 리뷰와 패치노트를 기반으로 업데이트 전후 반응 변화를 분석하고, 운영자가 확인해야 할 이슈와 대응 초안을 생성하는 것을 목표로 한다.
-
-이 프로젝트는 단순 감성분석이나 리뷰 요약기가 아니다. 핵심은 다음 흐름이다.
+이 프로젝트는 Steam 공개 데이터를 이용해 다음 과정을 지원한다.
 
 ```text
-업데이트 기준일 설정
+분석 가능한 패치 탐색
 → 패치 전후 리뷰 수집
-→ 리뷰 이슈 유형 분류
-→ 관련 패치노트/공지 검색
-→ 원인 후보와 심각도 생성
-→ 운영 리포트와 CS/공지 초안 생성
-→ 검색·분류·답변·tool call 로그 저장
-→ 평가셋 기반 품질 검증
+→ 통계와 규칙 기반 baseline 생성
+→ LLM으로 리뷰 이슈 구조화
+→ 관련 패치노트·공지 검색
+→ 근거가 연결된 분석 리포트 생성
+→ 검색·분류·생성 품질 평가
 ```
 
----
+이 시스템의 사용자는 게임 라이브 운영 또는 커뮤니티 담당자를 가정한다. 결과는 실제 원인을 확정하거나 운영 결정을 자동화하는 도구가 아니라, **공개 유저 반응을 빠르게 탐색하고 내부 확인 대상을 좁히는 분석 보조 자료**다.
 
-## 2. 문제 정의
+### 분석 대상
 
-| 기존 문제 | 프로젝트에서 다루는 방식 |
+| 항목 | 내용 |
 |---|---|
-| 업데이트 이후 부정 반응이 늘었는지 빠르게 파악하기 어렵다 | 패치 전후 기간의 부정 리뷰 비율과 이슈 유형 변화를 비교 |
-| 리뷰가 많아 사람이 직접 읽고 분류하기 어렵다 | 리뷰를 버그, 밸런스, 매칭, 성능, 과금, UX 등으로 분류 |
-| 어떤 패치 항목과 관련 있어 보이는지 모호하다 | 패치노트/공지 문서를 RAG로 검색해 관련 후보를 연결 |
-| LLM이 원인을 단정할 위험이 있다 | “원인 확정”이 아니라 “원인 후보”로 제한하고 근거를 함께 제시 |
-| 운영 대응 우선순위가 감에 의존한다 | 리뷰 빈도, 부정도, 심각도, 패치 관련성을 기준으로 우선순위화 |
-| 분석 결과를 재현하기 어렵다 | run_id, index_version, prompt_version, eval_dataset_version을 저장 |
+| 대상 게임 | Eternal Return / 이터널 리턴 |
+| Steam App ID | `1049590` |
+| 분석 대상 | Steam에 작성된 한국어 리뷰 |
+| 변경 근거 | Steam News API로 수집한 패치노트·핫픽스·공지 |
+| 기본 분석 단위 | 특정 패치 게시 시각 전후의 리뷰 window |
 
----
+이 프로젝트에서 말하는 유저 반응은 국내 전체 유저의 반응이 아니라 **Steam 한국어 리뷰 작성자의 반응**으로 한정한다.
 
-## 3. 데이터 출처와 현실성 검토
+## 2. 핵심 질문
 
-### 3.1 대상 게임
+이 프로젝트는 다음 질문에 답하는 것을 목표로 한다.
 
-1차 대상 게임은 **이터널 리턴**으로 둔다.
+1. 특정 업데이트 전후로 리뷰 수와 추천 비율이 어떻게 달라졌는가?
+2. 매칭, 서버, 밸런스, 버그 등 어떤 이슈가 증가하거나 감소했는가?
+3. 관측된 리뷰 이슈와 관련 가능성이 있는 패치노트 또는 공지는 무엇인가?
+4. 각 분석 문장을 어떤 리뷰와 문서 근거로 뒷받침할 수 있는가?
+5. 공개 근거가 부족할 때 원인을 단정하지 않고 판단을 보류할 수 있는가?
+6. 규칙 기반 방법과 비교했을 때 LLM/RAG가 실제로 무엇을 개선했는가?
 
-선정 이유:
+## 3. 포트폴리오에서 증명할 역량
 
-| 기준 | 판단 |
-|---|---|
-| 국내 게임 맥락 | Steam 페이지상 개발사는 Nimble Neuron, 퍼블리셔에는 Nimble Neuron, SapStaR Games, KRAFTON, Inc.가 표시됨 |
-| 라이브 운영형 게임 | MOBA, PvP, 배틀로얄 성격이라 패치·밸런스·매칭 반응 분석에 적합 |
-| 리뷰 수 | Steam 페이지 기준 전체 리뷰와 한국어 리뷰가 충분히 존재함 |
-| 패치 반응 분석 가능성 | 캐릭터, 밸런스, 매칭, 성능, 과금, 접속 이슈 등 분류 가능 |
+### 문제 정의와 현실성 검증
 
-### 3.2 실제 확보 가능한 데이터
+최신 기술을 먼저 적용하지 않고, 실제 확보 가능한 데이터와 사용자의 의사결정 문제를 확인한 뒤 해결 범위를 정한다.
 
-| 데이터 | 확보 방식 | 현실성 | 비고 |
-|---|---|---:|---|
-| 유저 리뷰 | Steam Store Reviews API | 높음 | 공식 문서화된 엔드포인트 사용 |
-| 리뷰 메타데이터 | Steam Store Reviews API | 높음 | 작성일, 추천/비추천, 언어, playtime 등 |
-| 게임 공지/패치노트 | Steam News API | 중~높음 | `GetNewsForApp` 사용. 단, 모든 뉴스가 패치노트라는 보장은 없음 |
-| 패치노트 구조화 | 수집 후 자체 파싱 | 중간 | 제목/본문/날짜 기반 분리 필요 |
-| 이슈 유형 라벨 | 직접 라벨링 | 가능 | 최소 500개 리뷰부터 시작 |
-| 패치 관련성 라벨 | 직접 라벨링 | 가능하지만 주관성 있음 | true/false/unknown으로 제한 |
-| SFT/DPO 데이터 | 직접 구축 | 가능 | 좋은 리포트 vs 위험한 리포트 pair 생성 |
+### 재현 가능한 데이터 파이프라인
 
-### 3.3 데이터 수집 관련 주의
+Steam API 수집, 응답 검증, 중복 방지, 수집 이력, 분석 설정과 결과 버전을 저장해 동일한 분석을 다시 실행할 수 있게 한다.
 
-- Steam Review API와 Steam News API는 공식 문서를 기준으로 사용한다.
-- 커뮤니티 게시글, 외부 팬사이트, 비공식 게시판 대량 크롤링은 1차 범위에서 제외한다.
-- 리뷰와 패치노트만으로 실제 장애·매칭·밸런스 원인을 확정할 수 없으므로, 결과는 항상 “원인 후보”로 표현한다.
-- 내부 게임 운영 지표, 서버 로그, 결제 로그는 접근할 수 없으므로 사용하지 않는다.
+### 관측과 추정의 분리
 
----
-
-## 4. 서비스 사용 시나리오
-
-### 시나리오 A. 업데이트 이후 반응 분석
-
-사용자 질문:
-
-```text
-최근 업데이트 이후 유저 반응이 나빠졌는지 분석해줘.
-```
-
-시스템 결과:
-
-| 항목 | 예시 |
-|---|---|
-| 분석 기간 | 패치 전 7일 vs 패치 후 7일 |
-| 부정 리뷰 비율 변화 | 21% → 38% |
-| 주요 이슈 | 매칭 지연, 특정 캐릭터 밸런스, 튕김 |
-| 관련 패치 항목 | 매칭 로직 변경, 캐릭터 A 스킬 조정 |
-| 판단 방식 | 원인 확정이 아니라 관련 가능성 높은 후보 제시 |
-| 운영 우선순위 | 튕김 > 매칭 > 밸런스 |
-| 생성 문서 | 운영 리포트, CS 답변 초안, 공지 초안 |
-
-### 시나리오 B. 특정 이슈 확인
-
-사용자 질문:
-
-```text
-이번 패치 이후 매칭 관련 불만이 늘었어?
-```
-
-Agent 처리:
-
-1. 매칭 관련 리뷰 필터링
-2. 패치 전후 매칭 관련 리뷰 비율 비교
-3. 패치노트에서 매칭 관련 변경 항목 검색
-4. 관련 후보 패치 항목 제시
-5. 근거 리뷰와 패치노트 항목 반환
-6. 내부 확인이 필요한 지표 제안
-
-### 시나리오 C. 공지/CS 초안 생성
-
-사용자 질문:
-
-```text
-접속 오류 관련 유저 공지 초안을 만들어줘.
-```
-
-Agent 처리:
-
-1. 접속, 튕김, 크래시 관련 리뷰 검색
-2. 관련 공지/패치노트 검색
-3. 근거가 부족하면 단정 표현 금지
-4. 유저 안내문 초안 생성
-5. 실제 게시 전 `approval_required` 상태로 보류
-
----
-
-## 5. 핵심 기능
-
-| 기능 | 설명 |
-|---|---|
-| 리뷰 수집 | appid, 언어, 기간, 긍정/부정 기준으로 Steam 리뷰 수집 |
-| 패치노트/공지 수집 | Steam News API 기반 공지·뉴스 수집 |
-| 리뷰 전처리 | 언어, 작성일, 추천 여부, 텍스트 정제 |
-| 패치노트 chunking | 제목, 날짜, 섹션, 패치 항목 단위로 분할 |
-| RAG 검색 | 리뷰 이슈와 관련 있는 패치노트/공지 검색 |
-| 이슈 분류 | 리뷰를 버그, 밸런스, 매칭, 성능, 과금, UX 등으로 분류 |
-| 패치 전후 비교 | 업데이트 전후 기간의 부정 리뷰와 이슈 유형 변화 비교 |
-| 운영 리포트 생성 | 주요 이슈, 원인 후보, 근거, 대응 우선순위 생성 |
-| CS/공지 초안 생성 | 단정 표현을 피한 유저 안내문 생성 |
-| 로그 저장 | request, retrieval, classification, tool call, answer 로그 저장 |
-| 평가 | RAG 검색, 이슈 분류, Agent workflow, 위험 답변을 평가 |
-| SFT/LoRA | 근거 기반 운영 리포트 스타일을 소형 모델에 튜닝 |
-| DPO | 좋은 리포트와 과장된 리포트 pair로 preference tuning 실험 |
-
----
-
-## 6. RAG/Agent 설계
-
-### 6.1 RAG 역할
-
-RAG는 LLM이 리뷰만 보고 원인을 단정하지 않도록, 패치노트와 공지 문서를 검색해 근거를 제공한다.
-
-| RAG 대상 | 용도 |
-|---|---|
-| 패치노트 | 캐릭터, 시스템, 밸런스, 매칭, 성능 관련 변경 항목 검색 |
-| 공지사항 | 점검, 알려진 이슈, 보상, 안내 사항 확인 |
-| 과거 패치노트 | 유사 이슈가 과거에도 있었는지 비교 |
-
-RAG 답변 규칙:
-
-- 답변에는 근거 패치노트/공지 chunk를 포함한다.
-- 근거가 없으면 “공개 문서 기준 확인 불가”로 답한다.
-- 리뷰는 유저 반응 근거이고, 패치노트는 변경 근거로 분리한다.
-- 원인을 확정하지 않고 “관련 가능성” 또는 “운영 확인 필요”로 표현한다.
-
-### 6.2 Agent tool
-
-| Tool | 입력 | 출력 |
+| 구분 | 의미 | 예시 |
 |---|---|---|
-| `get_reviews_by_period` | appid, start_date, end_date, language | 리뷰 목록 |
-| `get_patch_notes` | appid, start_date, end_date | 패치노트/공지 목록 |
-| `classify_review_issue` | review_text | issue_type, severity |
-| `compare_review_window` | before_reviews, after_reviews | 이슈 변화율 |
-| `search_related_patch_notes` | issue_type, query | 관련 patch_note_chunks |
-| `rank_issue_priority` | issue_count, severity, trend | 우선순위 |
-| `generate_ops_report` | 이슈 요약, 근거 | 운영 리포트 |
-| `generate_cs_reply` | 이슈, 근거, 제한사항 | CS 답변 초안 |
-| `log_agent_run` | 실행 결과 | 실행 로그 |
+| `observed` | 데이터에서 직접 계산하거나 확인한 사실 | 패치 후 매칭 관련 리뷰 비율 증가 |
+| `related_evidence` | 검색된 공개 문서상의 관련 후보 | 같은 기간의 매칭 로직 변경 항목 |
+| `needs_verification` | 공개 데이터로 확인할 수 없는 사항 | 실제 서버 장애 여부와 내부 원인 |
 
-### 6.3 Agent 상태값
+리뷰 변화와 패치 항목이 함께 발견되어도 인과관계로 단정하지 않는다.
 
-| 상태 | 의미 |
+### 평가 가능한 LLM/RAG
+
+LLM은 Steam에 이미 존재하는 `voted_up` 값을 다시 감성 분류하는 데 사용하지 않는다. 리뷰 이슈 구조화, 관련 문서 검색, 근거 기반 리포트 생성에 사용하며 규칙 기반 baseline과 비교한다.
+
+### 서비스 엔지니어링
+
+모델 호출뿐 아니라 API, DB, 테스트, CI, 오류 처리, latency·token·cost 측정, 입력 안전성까지 포함한 end-to-end 시스템을 구성한다.
+
+## 4. 데이터 출처와 제약
+
+| 데이터 | 출처 | 사용 목적 | 주요 제약 |
+|---|---|---|---|
+| 한국어 리뷰 | Steam Store Reviews API | 리뷰 수, 추천 비율, 이슈 변화 | 전체 플레이어를 대표하지 않음 |
+| 리뷰 메타데이터 | Steam Store Reviews API | 작성·수정 시각, 추천 여부, 플레이 시간 | 리뷰가 사후 수정될 수 있음 |
+| 뉴스·공지 | Steam News API | 패치 후보와 공개 근거 | 모든 뉴스가 패치노트는 아님 |
+| 패치 본문 | Steam News API `contents` | 정제, chunking, 검색 | 마크업 정제와 구조 복원이 필요함 |
+
+리포트에는 다음 제약을 항상 표시한다.
+
+- Steam 한국어 리뷰만 사용한다.
+- 리뷰 작성자는 전체 플레이어의 무작위 표본이 아니다.
+- 뉴스 게시 시각과 실제 패치 적용 시각이 다를 수 있다.
+- 분석 구간에 다른 패치나 핫픽스가 포함될 수 있다.
+- 공개 리뷰와 공지만으로 실제 장애나 밸런스 문제의 원인을 확정할 수 없다.
+- 리뷰 수가 적은 구간의 비율 변화는 불확실성이 크다.
+
+## 5. 데이터 가능성 검증
+
+### 5.1 선행 검증
+
+최신 패치를 분석 대상으로 고정하지 않는다. 먼저 리뷰 cursor를 순회해 실제 날짜 분포와 수량을 확인하고, 패치 후보별 coverage를 계산한다.
+
+초기 탐색에서는 최신 한국어 리뷰가 `2026-05-06` 부근으로 확인됐지만, 이 결과는 다음 조건을 검증하기 전까지 최종 데이터 제약으로 확정하지 않는다.
+
+- `filter=recent`
+- `language=koreana`
+- `purchase_type=all`
+- cursor URL encoding과 반복·종료 조건
+- Steam이 기본 제외하는 off-topic activity 포함 여부
+- `timestamp_created`와 `timestamp_updated`의 구분
+
+off-topic 리뷰는 업데이트 반응에 포함될 수 있으므로, 기본 제외 결과와 포함 결과를 sensitivity analysis로 비교한다.
+
+### 5.2 패치 기준 시각
+
+1.0에서는 Steam News API의 게시 시각을 일관된 분석 기준으로 사용한다.
+
+| 필드 | 의미 |
 |---|---|
-| `created` | 분석 요청 생성 |
-| `reviews_collected` | 리뷰 수집 완료 |
-| `patch_notes_indexed` | 패치노트 인덱싱 완료 |
-| `classified` | 리뷰 이슈 분류 완료 |
-| `retrieved` | 관련 패치노트 검색 완료 |
-| `analyzed` | 원인 후보·우선순위 생성 완료 |
-| `draft_generated` | 리포트/공지 초안 생성 |
-| `approval_required` | 외부 발행 전 승인 필요 |
-| `completed` | 분석 종료 |
-| `failed` | 실패 |
+| `published_at` | Steam News API 뉴스 게시 시각 |
+| `analysis_reference_at` | 전후 분석에 사용한 기준 시각 |
+| `reference_time_source` | `steam_news_date` |
 
----
+이는 실제 패치 적용 시각이 아니라 공개 API에서 반복적으로 얻을 수 있는 대체 기준이다.
 
-## 7. 8단계 구현 계획
+### 5.3 분석 구간
 
-| 단계 | 목표 | 구현 내용 |
-|---:|---|---|
-| 1 | 최소 세트 | 리뷰/패치노트 수집, RAG 검색, 기본 Agent workflow, 운영 리포트 생성 |
-| 2 | 운영성 보강 | 수집 run_id, document hash, index_version, 증분 인덱싱, 롤백 |
-| 3 | 관측성 | request/retrieval/classification/tool/latency/token/failure 로그 |
-| 4 | 보안/권한 | PII 마스킹, 욕설 원문 노출 제한, prompt injection 방어, 공지 발행 승인 |
-| 5 | 테스트/CI | unit/integration/no-answer/prompt-injection/regression test, GitHub Actions |
-| 6 | 버전 관리 | prompt/model/embedding/index/eval_dataset/tool_schema version 추적 |
-| 7 | SFT/LoRA | 운영 리포트 형식, 단정 금지, 근거 기반 답변 스타일 튜닝 |
-| 8 | DPO | 좋은 리포트 vs 과장·단정 리포트 pair로 preference tuning |
+기본 분석 구간은 전후 7일이다.
 
----
+```text
+before = [analysis_reference_at - 7 days, analysis_reference_at)
+after  = [analysis_reference_at, analysis_reference_at + 7 days)
+```
 
-## 8. 데이터 모델 초안
+DB 계산은 UTC를 기준으로 하고, 사용자 화면에는 UTC와 KST를 구분해 표시한다. 리뷰가 부족하면 window를 임의로 늘리지 않고 coverage 결과와 부적격 사유를 기록한다.
 
-### `games`
+### 5.4 패치 선택 규칙
 
-| 컬럼 | 설명 |
+결과를 본 뒤 변화가 큰 패치를 고르는 체리피킹을 막기 위해 선택 규칙을 분석 전에 고정한다.
+
+1. `patch_note`, `hotfix` 유형만 후보로 사용한다.
+2. 후보별 before/after 리뷰 수와 중첩 패치를 계산한다.
+3. 양쪽 모두 `min_reviews_per_window`를 충족한 후보만 적격으로 본다.
+4. 적격 후보 중 가장 최근 패치를 기본 분석 대상으로 선택한다.
+5. 추천 비율이나 이슈 변화는 패치 선택 기준으로 사용하지 않는다.
+6. `min_reviews_per_window`는 coverage pilot 이후 결정하고, 결과 분석 전에 버전과 함께 고정한다.
+
+```text
+patch_gid | reference_at | window_days | before_count | after_count
+          | overlapping_patches | eligible | exclusion_reason
+```
+
+### 5.5 프로젝트 진행 조건
+
+다음 조건을 만족해야 LLM/RAG 단계로 진행한다.
+
+- 전후 비교가 가능한 역사적 패치가 최소 3개 이상 존재한다.
+- 리뷰에 분류 가능한 이슈 정보가 충분히 포함되어 있다.
+- 여러 시기의 패치노트·공지로 검색 corpus를 구성할 수 있다.
+- 수작업 평가셋을 만들 수 있을 정도로 리뷰와 문서의 관계가 해석 가능하다.
+
+조건을 충족하지 못하면 게임, 언어 범위 또는 분석 window 변경을 검토하고 그 결정 근거를 남긴다.
+
+## 6. 시스템 구조
+
+```text
+[Steam News API]                 [Steam Review API]
+        │                                │
+        ▼                                ▼
+   news collector                  review collector
+        │                                │
+        └──────────────┬─────────────────┘
+                       ▼
+                PostgreSQL storage
+          raw data + collection run history
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+ deterministic analysis       document processing
+ count / ratio / baseline      clean / chunk / index
+          │                         │
+          └────────────┬────────────┘
+                       ▼
+               LLM issue extraction
+                       │
+                       ▼
+        BM25 / dense / hybrid retrieval
+                       │
+                       ▼
+          evidence-linked grounded report
+                       │
+                       ▼
+          evaluation + versioned run logs
+                       │
+                       ▼
+                FastAPI + demo UI
+```
+
+기본 분석 흐름은 deterministic pipeline으로 구현한다. 조건부 분기와 tool 선택이 실제로 필요한 분석 질의가 확인되기 전까지 Agent framework를 도입하지 않는다.
+
+## 7. 포트폴리오 1.0 범위
+
+### 포함
+
+- Steam 뉴스 유형 분류와 패치 후보 수집
+- Steam 한국어 리뷰 cursor 수집
+- PostgreSQL 저장, upsert, 수집 이력 관리
+- 패치별 coverage와 사전 정의된 선택 규칙
+- 전후 리뷰 수·추천 비율·퍼센트포인트 변화
+- 비율의 신뢰구간과 최소 표본 경고
+- 규칙 기반 keyword/issue baseline
+- LLM structured output 기반 multi-label 이슈 추출
+- 패치 문서 정제, 구조 기반 chunking, 인덱싱
+- BM25, dense, hybrid retrieval 비교
+- 근거 ID와 판단 보류가 포함된 리포트
+- 분류·검색·생성·안전성 평가
+- latency, token, cost, schema failure 로그
+- FastAPI 분석 API와 최소 데모 UI
+- pytest, GitHub Actions, Docker Compose
+
+### 제외
+
+- 영어 리뷰와 국가별 비교
+- 디시, 인벤, 루리웹 등 커뮤니티 크롤링
+- 접속자 수, 매출, 리텐션, CS, 서버 로그 등 내부 데이터
+- 실제 공지 또는 CS 답변 발행
+- 공개 데이터만으로 원인을 확정하는 기능
+- Kubernetes와 대규모 분산 처리
+- 실제 프로덕션 트래픽 운영 경험을 가장하는 구성
+
+### 1.0 이후 검토
+
+- 분석 질의에 따른 조건부 Agent workflow
+- 영어 리뷰 확장과 교차 언어 검색
+- reranker 또는 query transformation
+- 모델 routing과 cache를 통한 비용 최적화
+- SFT/LoRA 또는 preference tuning
+
+Agent와 fine-tuning은 사용 자체를 목표로 하지 않는다. 평가에서 반복되는 실패가 확인되고, 일반 파이프라인·프롬프트·검색 개선으로 해결하기 어려울 때만 별도 실험으로 진행한다.
+
+## 8. 핵심 설계
+
+### 8.1 수집과 재현성
+
+- API 호출, 응답 검증, 저장, 분석, 출력을 분리한다.
+- `recommendationid`와 `gid`를 기준으로 upsert한다.
+- 반복 cursor, 빈 페이지, 중복 리뷰, 비정상 timestamp에 명시적 중단 규칙을 둔다.
+- 수집 요청 파라미터, 시작·종료 시각, 건수, 중복 수, 실패 사유를 저장한다.
+- 원문과 정제된 본문을 분리하고 document hash를 기록한다.
+- prompt, model, embedding, chunking, index, label guide, eval dataset 버전을 추적한다.
+
+### 8.2 기본 통계와 baseline
+
+패치 전후에 다음 항목을 비교한다.
+
+- 전체 리뷰 수
+- 추천·비추천 리뷰 수
+- 추천 비율과 퍼센트포인트 변화
+- 가능한 경우 추천 비율의 Wilson confidence interval
+- 이슈별 리뷰 수와 전체 리뷰 대비 비율
+- overlapping patch와 데이터 부족 경고
+
+keyword baseline은 단어 출현 횟수보다 해당 이슈를 하나 이상 포함한 리뷰 수와 비율을 계산한다. 동의어 사전과 규칙 버전을 저장한다.
+
+### 8.3 리뷰 이슈 구조화
+
+리뷰 한 건은 여러 이슈를 포함할 수 있으므로 multi-label schema를 사용한다.
+
+```json
+{
+  "review_id": "...",
+  "issue_types": ["matchmaking", "performance"],
+  "summary": "...",
+  "evidence_spans": ["리뷰 원문에 실제로 존재하는 문장"],
+  "expression_intensity": "low | medium | high | unknown",
+  "confidence": 0.0
+}
+```
+
+초기 issue taxonomy는 다음과 같이 시작하고, 라벨링 pilot 후 병합하거나 분리한다.
+
+```text
+matchmaking / server_connection / performance / bug
+balance / character / monetization / ux / other
+```
+
+`expression_intensity`는 실제 장애의 심각도가 아니라 리뷰에 나타난 표현 강도다. 모델은 리뷰에 없는 원인이나 영향을 추론하지 않는다.
+
+### 8.4 패치 문서 처리
+
+- HTML·BBCode 등 마크업을 제거하되 원문을 보존한다.
+- 제목, 섹션, 하위 항목 구조를 우선해 chunk를 만든다.
+- chunk마다 `gid`, 섹션 경로, 원문 위치, hash를 기록한다.
+- 선택된 패치 하나만이 아니라 여러 시기의 패치노트·핫픽스·공지로 corpus를 구성한다.
+- 한국어 리뷰와 영문 패치노트 간 표현 차이를 검색 실험에 포함한다.
+
+### 8.5 검색 비교
+
+다음 검색 방식을 동일한 평가셋에서 비교한다.
+
+1. keyword baseline
+2. BM25
+3. multilingual dense embedding
+4. BM25 + dense hybrid
+
+reranker는 hybrid 검색에서도 명확한 오류가 남을 때만 추가한다. 기술 스택을 늘리는 것보다 각 방식이 성공하거나 실패한 이유를 분석하는 것을 우선한다.
+
+### 8.6 근거 기반 리포트
+
+리포트는 다음 세 구역을 명확히 분리한다.
+
+```text
+Observed changes
+- 직접 계산된 통계와 리뷰 이슈 변화
+
+Related public evidence
+- 관련 가능성이 있는 패치노트·공지 chunk
+
+Needs verification
+- 내부 로그나 추가 데이터가 필요한 사항
+```
+
+주요 분석 문장에는 review ID, 통계 run ID 또는 patch chunk ID를 연결한다. 근거가 충분하지 않으면 `insufficient_evidence`를 반환한다.
+
+리뷰와 뉴스 원문은 신뢰할 수 없는 데이터로 취급한다. 문서 안의 명령문을 시스템 지시로 실행하지 않으며, prompt injection과 비정상 입력을 회귀 테스트에 포함한다.
+
+## 9. 평가 계획
+
+### 9.1 평가셋
+
+개인 프로젝트에서 수작업 품질을 유지할 수 있는 범위로 구성한다.
+
+| 평가 대상 | 목표 규모 | 용도 |
+|---|---:|---|
+| 리뷰 이슈 라벨 | 150~300개 | baseline과 LLM 이슈 추출 비교 |
+| 검색 query·정답 chunk | 50~100개 | retrieval 비교 |
+| 근거 기반 리포트 사례 | 30~50개 | claim grounding과 판단 보류 평가 |
+| 근거 부족·공격 입력 | 20~30개 | no-answer와 prompt injection 평가 |
+
+라벨링 가이드를 먼저 작성하고 일부 데이터를 pilot labeling한 뒤 taxonomy를 고정한다. 가능하면 두 번째 라벨러의 검토를 받고, 어려우면 일정 간격을 둔 재라벨링으로 일관성을 확인한다.
+
+### 9.2 지표
+
+| 영역 | 핵심 지표 |
 |---|---|
-| `game_id` | 내부 게임 ID |
-| `steam_appid` | Steam appid |
-| `game_name` | 게임명 |
-| `developer` | 개발사 |
-| `publisher` | 퍼블리셔 |
+| 이슈 추출 | 라벨별 Precision/Recall, Macro-F1, schema failure rate |
+| 검색 | Recall@k, MRR 또는 nDCG |
+| 생성 | claim-level evidence support, citation precision, unsupported claim rate |
+| 판단 보류 | abstention precision/recall, no-answer accuracy |
+| 운영성 | latency, token usage, cost per report, retry/failure rate |
+| 안전성 | prompt injection 방어율, malformed input 처리율 |
 
-### `review_collection_runs`
+LLM-as-a-judge는 수작업 gold label을 대체하지 않고 보조 지표로만 사용한다. 평가 prompt와 judge model도 버전으로 관리한다.
 
-| 컬럼 | 설명 |
+### 9.3 필수 비교 실험
+
+- keyword baseline vs LLM issue extraction
+- BM25 vs dense vs hybrid retrieval
+- citation 강제 전후 unsupported claim 비율
+- 근거 부족 규칙 적용 전후 no-answer 성능
+- off-topic 리뷰 포함 여부에 따른 분석 결과 변화
+- chunking 또는 embedding 변경 전후 검색 품질·비용 변화
+
+최종 리포트에는 가장 좋은 결과뿐 아니라 실패 사례와 개선 전후를 함께 공개한다.
+
+## 10. 데이터 모델 초안
+
+| 테이블 | 역할 |
 |---|---|
-| `run_id` | 수집 실행 ID |
-| `steam_appid` | 대상 게임 |
-| `language` | 수집 언어 |
-| `start_date` | 수집 시작일 |
-| `end_date` | 수집 종료일 |
-| `review_type` | all/positive/negative |
-| `num_reviews` | 수집 리뷰 수 |
-| `status` | success/failed |
-| `error_message` | 실패 사유 |
+| `games` | 분석 대상 게임 기준 정보 |
+| `collection_runs` | 뉴스·리뷰 수집 실행 이력과 요청 파라미터 |
+| `steam_news` | 뉴스·공지·패치 후보 원문과 분류 결과 |
+| `steam_reviews` | 한국어 리뷰 원문과 메타데이터 |
+| `patch_window_reports` | 패치 전후 기본 분석 설정과 결과 |
+| `document_chunks` | 정제된 패치·공지 chunk와 위치·hash |
+| `review_issue_predictions` | baseline·LLM 이슈 추출 결과와 버전 |
+| `retrieval_runs` | query, 검색 방식, 순위, 점수, index version |
+| `analysis_runs` | 통계·검색·생성 실행을 연결하는 분석 run |
+| `report_claims` | 리포트 문장과 연결된 review·chunk 근거 |
+| `eval_examples` | 평가 입력, gold label, dataset version |
+| `eval_results` | 모델·검색·생성 평가 결과 |
 
-### `reviews`
+1차 DB migration에서는 Data MVP에 필요한 테이블만 만들고, LLM/RAG 테이블은 해당 단계에서 추가한다.
 
-| 컬럼 | 설명 |
+## 11. 기술 스택과 선택 기준
+
+| 영역 | 1.0 선택 | 이유 |
+|---|---|---|
+| 언어 | Python | 데이터·LLM 생태계와 채용 직무 적합성 |
+| API | FastAPI | typed schema와 비동기 API 구성 |
+| DB | PostgreSQL | 원문·실행 이력·분석 결과 통합 관리 |
+| Vector search | pgvector | 별도 Vector DB 운영 없이 PostgreSQL과 통합 |
+| Keyword search | BM25 baseline | dense 검색의 효과를 비교할 기준 |
+| LLM | API 기반 모델 1종부터 시작 | 평가 기준을 먼저 고정하고 모델 수를 제한 |
+| Embedding | 한국어·영어 지원 multilingual 모델 | 교차 언어 검색 대응 |
+| UI | Streamlit 또는 최소 웹 UI | 분석 결과와 근거 탐색용 데모 |
+| 테스트 | pytest | 수집·분석·평가 회귀 테스트 |
+| CI | GitHub Actions | 테스트와 평가 smoke test 자동화 |
+| 배포 | Docker Compose | 로컬 재현성과 의존성 격리 |
+
+처음부터 orchestration framework에 의존하지 않는다. 직접 구현한 pipeline으로 책임과 입출력을 명확히 한 뒤, 복잡도가 실제로 증가할 때 LangGraph 같은 도구를 검토한다.
+
+## 12. 개발 로드맵
+
+### Phase 0. Feasibility Gate
+
+완료 조건:
+
+- 한국어 리뷰 날짜·수량 분포 확인
+- cursor 종료·중복·off-topic 처리 검증
+- 패치 후보별 coverage 표 생성
+- 분석 가능한 패치 최소 3개 확인
+- 데이터가 부족할 경우 범위 변경 결정 기록
+
+### Phase A. Data MVP
+
+완료 조건:
+
+- 리뷰와 뉴스의 재현 가능한 수집·저장
+- 수집 이력, 중복 수, 실패 사유 기록
+- 패치 선택 규칙과 window 분석 구현
+- 리뷰 수·추천 비율·신뢰구간 생성
+- versioned keyword baseline 생성
+- CLI 또는 API로 결과 재현
+
+### Phase B. LLM/RAG MVP
+
+완료 조건:
+
+- 패치 문서 정제와 구조 기반 chunking
+- structured output 이슈 추출
+- BM25·dense·hybrid 검색 구현
+- 주요 문장에 근거 ID가 있는 리포트 생성
+- 근거 부족 시 `insufficient_evidence` 반환
+
+### Phase C. Evaluation
+
+완료 조건:
+
+- 라벨링 가이드와 versioned 평가셋 공개
+- baseline 대비 분류·검색 성능 비교
+- unsupported claim과 판단 보류 평가
+- latency·token·cost·failure 측정
+- prompt injection과 회귀 테스트 구성
+
+### Phase D. Portfolio Delivery
+
+완료 조건:
+
+- FastAPI와 최소 데모 UI
+- Docker 기반 재현 가능한 실행 환경
+- 테스트와 CI 통과
+- 실제 분석 사례 3~5개
+- 실패 사례와 개선 전후 평가 리포트
+- 3~5분 데모 영상과 면접용 아키텍처 설명
+
+## 13. 데모 시나리오
+
+사용자가 분석 가능한 패치를 선택하면 다음 화면을 제공한다.
+
+1. 패치 기준 시각과 before/after coverage
+2. 리뷰 수와 추천 비율 변화
+3. 이슈 유형별 리뷰 비율 변화
+4. 대표 리뷰와 원문 evidence span
+5. 관련 패치노트·공지 chunk와 검색 점수
+6. `observed`, `related_evidence`, `needs_verification` 리포트
+7. 데이터 부족, 중첩 패치, 근거 부족 경고
+
+챗봇 UI보다 분석 근거와 불확실성을 한 화면에서 검증할 수 있는 대시보드를 우선한다.
+
+## 14. 실행 방법
+
+### 환경 구성
+
+```bash
+cp .env.example .env
+python -m pip install -r requirements.txt
+docker compose up -d
+python -m app.cli.migrate
+```
+
+`OPENAI_API_KEY`가 없어도 수집, 기본 통계, keyword baseline, BM25 검색, deterministic 리포트를 실행할 수 있다. LLM 이슈 추출, dense/hybrid 검색, LLM 리포트 생성에는 API 키가 필요하다.
+
+### 데이터 수집과 분석
+
+```bash
+python -m app.cli.collect_data news --count 100
+python -m app.cli.collect_data reviews --max-pages 10
+python -m app.cli.show_coverage
+python -m app.cli.index_news
+python -m app.cli.analyze_patch PATCH_GID --method bm25
+```
+
+LLM/RAG 전체 경로는 다음처럼 실행한다.
+
+```bash
+python -m app.cli.index_news --with-embeddings
+python -m app.cli.analyze_patch PATCH_GID \
+  --method hybrid \
+  --issue-method llm \
+  --generation-method llm
+```
+
+### API
+
+```bash
+python -m uvicorn app.api.main:app --reload
+```
+
+| Endpoint | 역할 |
 |---|---|
-| `review_id` | Steam recommendationid |
-| `steam_appid` | 게임 appid |
-| `language` | 언어 |
-| `review_text` | 리뷰 본문 |
-| `voted_up` | 추천/비추천 |
-| `timestamp_created` | 작성일 |
-| `playtime_forever` | 총 플레이 시간 |
-| `run_id` | 수집 실행 ID |
+| `GET /` | 패치 분석 대시보드 |
+| `GET /health` | DB 연결 상태 확인 |
+| `GET /patches` | 패치 후보 조회 |
+| `GET /coverage` | 후보별 전후 리뷰 coverage |
+| `POST /index` | 뉴스 문서 chunking·embedding |
+| `GET /search` | BM25·dense·hybrid 검색 |
+| `POST /reports/{patch_gid}` | 패치 window 분석과 근거 리포트 |
 
-### `patch_notes`
+## 15. 현재 구현 상태
 
-| 컬럼 | 설명 |
+### 코드 구현 완료
+
+- PostgreSQL·Docker 기본 구성
+- Python DB 연결
+- Steam News API 호출
+- 뉴스 제목 기반 유형 분류
+- `steam_news` 저장·upsert
+- patch candidate 조회 CLI
+- patch window 계산 초안
+- Steam Review API 1페이지 호출과 cursor 확인
+- cursor 반복·빈 페이지·retry·off-topic 옵션을 포함한 다중 페이지 수집
+- 리뷰 upsert와 수집 run 성공·실패 이력
+- 패치별 coverage와 중첩 패치 탐지
+- 추천 비율, Wilson confidence interval, 이슈 비율 baseline
+- 패치 문서 정제, section chunking, hash와 provenance
+- BM25, pgvector dense, reciprocal-rank hybrid 검색
+- structured output LLM 이슈 추출과 exact evidence span 검증
+- deterministic 또는 LLM 기반 grounded report와 citation allowlist 검증
+- 분석·검색·모델·토큰·latency 실행 로그
+- FastAPI endpoint와 평가 CLI
+- 통계·분류·chunking·검색·평가·리포트 단위 테스트
+
+### 실제 데이터 통합 검증
+
+2026-07-19에 실제 Steam 공개 데이터로 다음 흐름을 검증했다.
+
+- pgvector PostgreSQL migration과 초기 데이터 생성
+- Steam 뉴스 100건 수집·upsert
+- 한국어 리뷰 10페이지, 1,000건 수집·upsert
+- 수집 범위: `2026-02-04`부터 `2026-05-06`까지
+- 전후 7일, 최소 30건 조건을 충족하는 패치 후보 3개 확인
+- 뉴스 96건을 146개 chunk로 정제·인덱싱
+- 적격 hotfix 1건의 통계·keyword baseline·BM25·grounded report 생성
+- 미래 공지가 검색되는 시간 누수를 발견하고 분석 window 필터로 수정
+- FastAPI의 health, patches, coverage, search, report endpoint 통합 테스트
+
+### 포트폴리오 완성을 위해 남은 작업
+
+- 수작업 평가셋 구축과 baseline·LLM·검색 실험 결과
+- 전체 cursor 탐색과 off-topic 포함 여부 sensitivity analysis
+- OpenAI API 키를 사용한 LLM issue extraction과 dense/hybrid 검색 검증
+- 실제 API 비용, latency, token 수치 수집
+- 분석 사례 3~5개와 데모 영상 제작
+
+오프라인 단위 테스트와 PostgreSQL·FastAPI 통합 테스트는 검증했다. LLM 및 embedding 경로는 API 키가 없어 schema·guardrail 수준까지만 검증했으며 성능 수치를 주장하지 않는다.
+
+전체 진행률을 하나의 퍼센트로 표현하지 않고 각 Phase의 완료 조건으로 관리한다.
+
+## 16. 주요 위험과 대응
+
+| 위험 | 대응 |
 |---|---|
-| `patch_id` | 패치/공지 ID |
-| `steam_appid` | 게임 appid |
-| `title` | 제목 |
-| `published_at` | 게시일 |
-| `content` | 원문 |
-| `source_url` | 출처 |
-| `version` | 문서 버전 |
-| `ingested_at` | 수집일 |
+| 한국어 리뷰 표본 부족 | coverage gate 후 게임·언어·window 변경 여부 결정 |
+| 게시 시각과 실제 적용 시각 불일치 | `reference_time_source` 표시, 인과 표현 금지 |
+| 중첩 패치와 외부 이벤트 | window 내 다른 변경 사항을 함께 기록 |
+| 이슈 taxonomy의 주관성 | pilot labeling과 라벨 가이드, multi-label 허용 |
+| 패치 관련성 과대 해석 | 관련 후보와 원인 확정을 분리, 판단 보류 제공 |
+| RAG corpus가 너무 작음 | 여러 시기의 패치·핫픽스·공지 포함 |
+| LLM 평가의 자기참조 | 수작업 gold label 중심, judge 모델은 보조로 사용 |
+| 기술 스택 과잉 | baseline과 실패가 확인된 경우에만 구성 요소 추가 |
+| prompt injection | 원문을 비신뢰 데이터로 격리하고 공격 평가셋 운영 |
 
-### `review_labels`
-
-| 컬럼 | 설명 |
-|---|---|
-| `review_id` | 리뷰 ID |
-| `issue_type` | bug/balance/matchmaking/performance/monetization/ux |
-| `severity` | high/medium/low |
-| `patch_related` | true/false/unknown |
-| `gold_patch_chunk_id` | 관련 패치노트 chunk |
-| `labeler` | 라벨러 |
-
----
-
-## 9. 평가 설계
-
-### 9.1 RAG 평가
-
-| 지표 | 설명 |
-|---|---|
-| `retrieval@k` | 정답 패치노트 chunk가 top-k 안에 있는지 |
-| `MRR` | 정답 chunk가 얼마나 앞에 나오는지 |
-| `citation_accuracy` | 답변의 근거 chunk가 실제 근거인지 |
-| `no_answer_accuracy` | 근거 없을 때 답변을 거절하는지 |
-
-### 9.2 리뷰 분류 평가
-
-| 지표 | 설명 |
-|---|---|
-| `issue_type_accuracy` | 리뷰 이슈 유형 분류 정확도 |
-| `severity_accuracy` | 심각도 분류 정확도 |
-| `patch_related_accuracy` | 패치 관련성 판단 정확도 |
-
-### 9.3 Agent 평가
-
-| 지표 | 설명 |
-|---|---|
-| `tool_call_accuracy` | 올바른 tool을 호출했는지 |
-| `workflow_completion_rate` | 전체 분석 workflow 완료율 |
-| `unsafe_answer_rate` | 원인 단정, 근거 없는 보상 약속 등 위험 답변 비율 |
-| `report_usefulness_score` | 사람이 평가한 운영 리포트 유용성 |
-
----
-
-## 10. SFT/LoRA와 DPO 계획
-
-### 10.1 SFT/LoRA
-
-학습 목표는 “게임 지식 주입”이 아니라 운영 리포트 답변 스타일 튜닝이다.
-
-| 학습 목표 | 예시 |
-|---|---|
-| 근거 기반 답변 | 리뷰 수치와 패치노트 근거 포함 |
-| 단정 금지 | “원인” 대신 “원인 후보” 표현 |
-| 운영 액션 제안 | 확인 지표, 담당팀, 우선순위 제안 |
-| CS 문안 스타일 | 유저에게 과도한 약속을 하지 않는 안내 |
-| 답변 불가 처리 | 근거 부족 시 추가 확인 필요 |
-
-목표 수량:
-
-| 데이터 | 목표 |
-|---|---:|
-| 운영 리포트 instruction-response | 300~500 |
-| CS 답변 초안 | 100~200 |
-| no-answer/refusal 케이스 | 100 |
-| 근거 기반 답변 | 200 |
-| 과장 답변 수정 케이스 | 100 |
-
-### 10.2 DPO
-
-| chosen | rejected |
-|---|---|
-| “패치 후 7일간 매칭 관련 부정 리뷰가 증가했습니다. 관련 후보는 매칭 로직 변경 항목이며, 원인 확정 전 내부 지표 확인이 필요합니다.” | “이번 패치 때문에 매칭이 망가졌습니다.” |
-| “접속 오류 관련 리뷰가 늘었으나 패치노트에 직접 근거는 없습니다. 클라이언트 로그 확인이 필요합니다.” | “패치 이후 접속 오류가 발생한 것이 확실합니다.” |
-| “유저 공지 초안: 일부 환경에서 문제가 보고되어 확인 중입니다.” | “문제가 해결될 예정입니다.” |
-| “근거 리뷰 12건과 패치노트 항목 2개를 기준으로 원인 후보를 제시합니다.” | “대부분 유저가 이 패치를 싫어합니다.” |
-
-목표 수량:
-
-| 데이터 | 목표 |
-|---|---:|
-| preference pair | 200~500 |
-| 과장 원인 단정 pair | 100 |
-| 근거 없는 답변 pair | 100 |
-| CS 문안 pair | 100 |
-
----
-
-## 11. 기술 스택
-
-| 영역 | 선택 |
-|---|---|
-| 언어 | Python |
-| API | FastAPI |
-| UI | Streamlit |
-| DB | PostgreSQL |
-| Vector DB | pgvector 또는 Chroma |
-| 배치/수집 | Python scheduler 또는 Airflow Lite 구성 |
-| Agent workflow | LangGraph 또는 직접 state machine |
-| Embedding | OpenAI embedding 또는 bge 계열 |
-| LLM | OpenAI/Claude API, 이후 오픈소스 모델 실험 |
-| 튜닝 | Hugging Face Transformers, PEFT, TRL |
-| 테스트 | pytest |
-| CI | GitHub Actions |
-| 배포 | Docker Compose |
-
----
-
-## 12. 산출물
+## 17. 산출물
 
 | 산출물 | 내용 |
 |---|---|
-| README | 문제 정의, 아키텍처, 실행 방법 |
-| 데이터 수집 문서 | Steam API 사용 방식, 수집 범위, 제한 |
-| 데이터 카드 | 리뷰/패치노트 데이터 설명과 한계 |
-| 라벨링 가이드 | issue_type, severity, patch_related 기준 |
-| 평가 리포트 | RAG, 분류, Agent 평가 결과 |
-| 운영 리포트 샘플 | 실제 분석 결과 예시 3~5개 |
-| SFT/DPO 리포트 | before/after 결과와 한계 |
-| Runbook | 수집 실패, 인덱싱 실패, 평가 재실행 방법 |
-| 데모 영상 | 3~5분 |
+| README | 문제 정의, 범위, 아키텍처, 실행·평가 방법 |
+| 데이터 카드 | 수집 데이터, 표본 특성, 사용 제한 |
+| 라벨링 가이드 | issue taxonomy와 근거 판단 기준 |
+| 평가셋 | 리뷰 분류, 검색, 판단 보류 사례 |
+| 평가 리포트 | baseline 비교, 실패 사례, 비용·지연시간 |
+| 분석 리포트 샘플 | 실제 패치 분석 결과 3~5개 |
+| Runbook | 수집·인덱싱·평가 실패 시 재실행 방법 |
+| 데모 | 분석 대시보드와 3~5분 영상 |
 
----
+## 18. 포트폴리오 표현 원칙
 
-## 13. 현실성 검토
+### 최종 요약 문장
 
-### 가능한 것
+> Steam 한국어 리뷰와 패치노트 공개 데이터를 수집해 업데이트 전후의 반응 변화를 분석하고, 규칙 기반 baseline과 LLM/RAG를 비교해 근거가 있는 분석만 생성하도록 설계·평가한 프로젝트입니다. 데이터 가능성 검증부터 검색 품질, claim 단위 근거, 판단 보류, 비용과 실패율까지 재현 가능한 파이프라인으로 관리했습니다.
 
-| 항목 | 판단 |
-|---|---|
-| Steam 리뷰 수집 | 가능. 공식 Review API 사용 |
-| Steam 뉴스/공지 수집 | 가능. 공식 News API 사용 |
-| 한국어 리뷰 기반 분석 | 가능. 언어 파라미터와 Steam 페이지의 한국어 리뷰 존재 확인 |
-| 패치 전후 비교 | 가능. 패치 날짜 기준 기간 설정 |
-| 리뷰 이슈 라벨링 | 가능. 직접 라벨링 필요 |
-| 운영 리포트 생성 | 가능. 단, 내부 로그 없이 원인 후보 수준 |
-| RAG/Agent 8단계 구현 | 가능. 일부는 PoC 수준으로 명시해야 함 |
+### 사용하지 않을 표현
 
-### 제한되는 것
-
-| 항목 | 제한 |
-|---|---|
-| 실제 원인 확정 | 불가. 내부 로그와 실험 데이터 없음 |
-| 실제 게임 운영 개선 | 불가. 개인 프로젝트 |
-| 실제 공지 발행 | 불가. mock approval로 제한 |
-| 커뮤니티 전체 반응 수집 | 1차 범위에서 제외 |
-| 대규모 LLM 운영 | 개인 프로젝트 범위 밖 |
-| SFT/DPO 실무 경험 주장 | 불가. 개인 실험으로만 표현 |
-
----
-
-## 14. 포트폴리오용 요약 문장
-
-> 게임 업데이트 이후 유저 리뷰 변화를 분석하는 RAG/Agent 시스템을 구현했습니다. Steam Review API와 Steam News API를 활용해 리뷰와 패치노트 데이터를 수집하고, 패치 전후 리뷰를 이슈 유형별로 분류한 뒤 관련 패치노트 근거를 검색해 원인 후보와 운영 대응 우선순위를 생성했습니다. 또한 요청·검색·분류·tool call·latency·token 사용량 로그를 저장하고, 근거 없는 원인 단정과 과장된 운영 리포트를 평가셋과 DPO 실험으로 개선했습니다.
-
----
-
-## 15. 말하지 않을 것
-
-| 금지 표현 | 이유 |
+| 표현 | 이유 |
 |---|---|
 | 게임 운영 데이터를 분석했다 | 내부 운영 데이터가 없음 |
-| 패치 원인을 자동으로 밝혀냈다 | 공개 리뷰만으로 원인 확정 불가 |
+| 패치 문제의 원인을 자동으로 밝혀냈다 | 공개 데이터만으로 인과관계 확정 불가 |
+| 전체 국내 유저 반응을 분석했다 | Steam 한국어 리뷰로 표본이 제한됨 |
 | 실제 운영팀이 사용했다 | 개인 프로젝트 |
-| 리뷰 폭탄을 해결했다 | 탐지/분석/초안 생성까지만 가능 |
-| LLM 운영 경험 | PoC/개인 프로젝트 수준 |
-| SFT/DPO 실무 경험 | 실험으로만 표현 |
+| 프로덕션에서 대규모 운영했다 | 개인 개발·배포 범위 |
+| Agent나 fine-tuning을 완료했다 | 실제 평가와 구현이 끝난 뒤에만 주장 가능 |
 
----
+## 19. 참고 자료
 
-## 16. 참고 출처
-
-- Steam Store Reviews API: https://partner.steamgames.com/doc/store/getreviews
-- Steam News API: https://partner.steamgames.com/doc/webapi/ISteamNews
-- Eternal Return Steam page: https://store.steampowered.com/app/1049590/Eternal_Return/
+- [Steam Store Reviews API](https://partner.steamgames.com/doc/store/getreviews)
+- [Steam News API](https://partner.steamgames.com/doc/webapi/ISteamNews)
+- [Eternal Return Steam page](https://store.steampowered.com/app/1049590/Eternal_Return/)
