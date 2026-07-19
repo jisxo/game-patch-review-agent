@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+
+postgres_data/
+
+data/raw/
+data/processed/
+*.csv
+*.json
+*.jsonl
+
+.DS_Store
